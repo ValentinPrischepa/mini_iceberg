@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 from collections import Counter
 from json import JSONDecodeError
@@ -19,6 +17,14 @@ class DataFileAlreadyExistsError(Exception):
 
 
 class MetadataFileIsCorruptedError(Exception):
+    pass
+
+
+class DuplicatedInputFilesError(Exception):
+    pass
+
+
+class ConcurrentModificationError(Exception):
     pass
 
 
@@ -70,6 +76,16 @@ def append(table_name: str, files: list[str]) -> None:
     last_version, existed_files = read_metadata(table_name)
     if not files:
         return
+
+    duplicated_input_files = [
+        file
+        for file, count in Counter(files).items()
+        if count > 1
+    ]
+
+    if duplicated_input_files:
+        raise DuplicatedInputFilesError(f"Input data contains the following duplicated files:{duplicated_input_files}")
+
     overlapped_files = [
         file
         for file, count in Counter(existed_files + files).items()
@@ -79,6 +95,11 @@ def append(table_name: str, files: list[str]) -> None:
         raise DataFileAlreadyExistsError(f"The following data files already exist in {table_name} table: {overlapped_files}")
     new_metadata_file = Path(table_name) / f"metadata/v{last_version + 1}.json"
     all_files = existed_files + files
-    with new_metadata_file.open("x") as f:
-        metadata = {"files": all_files}
-        json.dump(metadata, f)
+    try:
+        with new_metadata_file.open("x") as f:
+            metadata = {"files": all_files}
+            json.dump(metadata, f)
+    except FileExistsError:
+        raise ConcurrentModificationError(
+            f"Metadata version {last_version + 1} for table {table_name} was written concurrently"
+        ) from None

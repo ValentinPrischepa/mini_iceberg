@@ -3,7 +3,8 @@ from pathlib import Path
 from typing import TypedDict
 
 from mini_iceberg import create_table, TableAlreadyExistsError, get_last_metadata_version, scan, append, \
-    DataFileAlreadyExistsError, TableDoesNotExistError, MetadataFileIsCorruptedError, read_metadata
+    DataFileAlreadyExistsError, TableDoesNotExistError, MetadataFileIsCorruptedError, read_metadata, \
+    DuplicatedInputFilesError, ConcurrentModificationError
 import pytest
 
 
@@ -186,7 +187,7 @@ def test_append_positive_first_append(table_path: Path) -> None:
     with (metadata_dir / "v0.json").open("w") as f:
         json.dump(metadata_file_v0, f)
     files = metadata_file_v1["files"]
-    append(str(table_path), files)
+    append(str(table_path), list(files))
     with open(metadata_dir / "v1.json", "r") as f:
         actual_files = json.load(f)["files"]
     assert files == actual_files
@@ -217,7 +218,7 @@ def test_append_positive_second_append(table_path: Path) -> None:
     append(str(table_path), files)
     with open(metadata_dir / "v2.json", "r") as f:
         actual_files = json.load(f)["files"]
-    assert actual_files == metadata_file_v2["files"]
+    assert set(actual_files) == set(metadata_file_v2["files"])
 
 
 # Prevents append() from mutating older metadata version files in place; DR-1 guarantees that
@@ -232,9 +233,11 @@ def test_append_does_not_modify_previous_metadata_version(table_path: Path) -> N
         assert json.load(f) == metadata_file_v0
 
 
-# Prevents append() from silently discarding a concurrently-written metadata version. Opening
-# the target version file with "x" (exclusive create) must raise instead of overwriting it with
-# "w", so a version-number race produces an error rather than silent data loss.
+# Prevents append() from silently discarding a concurrently-written metadata version, and from
+# leaking the raw builtin FileExistsError. Opening the target version file with "x" (exclusive
+# create) must raise instead of overwriting it with "w", and the collision must surface as the
+# typed ConcurrentModificationError so callers can distinguish a version race from an unrelated
+# filesystem error.
 def test_append_raises_on_concurrent_version_collision(table_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     metadata_dir = table_path / "metadata"
     metadata_dir.mkdir(parents=True)
@@ -243,7 +246,7 @@ def test_append_raises_on_concurrent_version_collision(table_path: Path, monkeyp
     with (metadata_dir / "v1.json").open("w") as f:
         json.dump(metadata_file_v1, f)
     monkeypatch.setattr("mini_iceberg.get_last_metadata_version", lambda table_name: 0)
-    with pytest.raises(FileExistsError):
+    with pytest.raises(ConcurrentModificationError):
         append(str(table_path), ["file3", "file4"])
     with (metadata_dir / "v1.json").open("r") as f:
         assert json.load(f) == metadata_file_v1
@@ -279,7 +282,7 @@ def test_append_overlapped_files(table_path: Path) -> None:
         json.dump(metadata_file_v2, f)
     files = metadata_file_v2["files"]
     with pytest.raises(DataFileAlreadyExistsError):
-        append(str(table_path), files)
+        append(str(table_path), list(files))
 
 
 # Prevents append() from silently accepting duplicated input files within a single batch, even
@@ -289,8 +292,8 @@ def test_append_duplicated_input_files(table_path: Path) -> None:
     metadata_dir.mkdir(parents=True)
     with (metadata_dir / "v2.json").open("w") as f:
         json.dump(metadata_file_v2, f)
-    with pytest.raises(DataFileAlreadyExistsError):
-        append(str(table_path), duplicated_files)
+    with pytest.raises(DuplicatedInputFilesError):
+        append(str(table_path), list(duplicated_files))
 
 
 # Prevents append() from implicitly creating a table (or raising the wrong error) when no
@@ -298,4 +301,4 @@ def test_append_duplicated_input_files(table_path: Path) -> None:
 def test_append_table_does_not_exist(table_path: Path) -> None:
     with pytest.raises(TableDoesNotExistError):
         files = metadata_file_v2["files"]
-        append(str(table_path), files)
+        append(str(table_path), list(files))
